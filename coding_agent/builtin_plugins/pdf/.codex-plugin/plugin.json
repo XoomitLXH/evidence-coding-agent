@@ -1,0 +1,6 @@
+{
+  "name": "pdf",
+  "version": "1.0.0",
+  "description": "Read bounded text from workspace PDF files.",
+  "tools": "./tools.py"
+}

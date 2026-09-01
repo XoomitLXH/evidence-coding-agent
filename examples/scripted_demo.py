@@ -74,7 +74,12 @@ def run_demo(workspace: Path) -> dict[str, Any]:
             "demo-5",
         ),
     ]
-    report = AgentLoop(prepared_workspace, ScriptedModel(responses), max_steps=len(responses)).run(
+    report = AgentLoop(
+        prepared_workspace,
+        ScriptedModel(responses),
+        max_steps=len(responses),
+        require_draft_review=False,
+    ).run(
         "Fix add() and run the regression test."
     )
     return {

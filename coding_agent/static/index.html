@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#15191d">
+    <title>Evidence Agent</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand" aria-label="Evidence Agent">
+          <span class="brand-mark">EA</span>
+          <span class="brand-name">Evidence Agent</span>
+          <span class="status-dot" id="model-status">检查模型</span>
+        </div>
+        <div class="topbar-actions">
+          <button class="icon-button" id="new-task" type="button" title="新建任务" aria-label="新建任务"><i data-lucide="square-pen"></i></button>
+          <button class="icon-button" id="toggle-inspector" type="button" title="显示或隐藏检查器" aria-label="显示或隐藏检查器"><i data-lucide="panel-right"></i></button>
+        </div>
+      </header>
+
+      <aside class="sidebar" aria-label="工作区">
+        <div class="sidebar-section recent-section">
+          <div class="section-heading"><span>会话</span><button class="icon-button compact" id="add-session" type="button" title="新建会话" aria-label="新建会话"><i data-lucide="plus"></i></button></div>
+          <div class="session-list" id="session-list" aria-live="polite">
+            <div class="session-empty">暂无历史任务</div>
+          </div>
+        </div>
+        <div class="sidebar-section workspace-section">
+          <div class="section-heading"><span>工作区</span><button class="icon-button compact" id="refresh-tree" type="button" title="刷新文件" aria-label="刷新文件"><i data-lucide="refresh-cw"></i></button></div>
+          <div class="workspace-path" id="workspace-path">加载中</div>
+          <nav class="file-tree" id="file-tree" aria-label="文件树"></nav>
+        </div>
+        <div class="sidebar-footer"><i data-lucide="shield-check"></i><span>受控工作区</span></div>
+      </aside>
+
+      <main class="chat-workspace">
+        <div class="conversation" id="conversation" aria-live="polite">
+          <article class="message assistant-message">
+            <div class="avatar agent-avatar">EA</div>
+            <div class="message-body">
+              <div class="message-meta"><span>Evidence Agent</span><time>现在</time></div>
+              <p>准备好处理工作区中的任务。</p>
+            </div>
+          </article>
+        </div>
+        <section class="composer-panel" aria-label="任务输入">
+          <div class="reference-menu hidden" id="reference-menu" role="listbox"></div>
+          <div class="plugin-menu hidden" id="plugin-menu" role="menu" aria-label="选择插件"></div>
+          <div class="composer">
+            <textarea id="task-input" rows="3" placeholder="描述需要修改、排查或验证的内容…" aria-label="任务描述"></textarea>
+            <div class="selected-plugin-list hidden" id="selected-plugin-list" aria-label="已选插件"></div>
+            <div class="composer-footer">
+              <div class="composer-controls">
+                <button class="icon-button composer-add" id="plugin-toggle" type="button" title="选择插件" aria-label="选择插件" aria-expanded="false"><i data-lucide="plus"></i></button>
+                <div class="mode-switch" aria-label="运行模式">
+                  <button class="mode-button" id="plan-mode" type="button" aria-pressed="false">计划</button>
+                  <button class="mode-button active" id="execute-mode" type="button" aria-pressed="true">直接执行</button>
+                </div>
+                <span class="reference-hint"><i data-lucide="at-sign"></i> 引用文件</span>
+              </div>
+              <button class="send-button" id="send-task" type="button" title="开始任务" aria-label="开始任务"><i data-lucide="arrow-up"></i></button>
+            </div>
+          </div>
+        </section>
+      </main>
+
+      <div
+        class="inspector-resizer"
+        id="inspector-resizer"
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="调整 IDE 宽度"
+        tabindex="0"
+      ></div>
+
+      <aside class="inspector" id="inspector" aria-label="检查器">
+        <div class="inspector-head">
+          <span>IDE</span>
+          <span class="task-state" id="task-state">空闲</span>
+        </div>
+        <section class="inspector-main" aria-label="文件编辑器">
+          <div class="editor-toolbar">
+            <div class="editor-file-meta">
+              <span class="editor-path" id="editor-path">未打开文件</span>
+              <span class="editor-status" id="editor-status">只读</span>
+            </div>
+            <div class="editor-actions">
+              <button class="editor-action" id="run-file" type="button" title="运行当前 Python 文件" disabled><i data-lucide="play"></i><span>运行</span></button>
+              <button class="editor-action" id="debug-file" type="button" title="调试当前 Python 文件" disabled><i data-lucide="bug"></i><span>调试</span></button>
+              <button class="icon-button compact" id="save-file" type="button" title="保存文件" aria-label="保存文件" disabled><i data-lucide="save"></i></button>
+            </div>
+          </div>
+          <div class="editor-notice hidden" id="editor-notice" role="status">
+            <span id="editor-notice-text">智能体修改了此文件，未保存草稿仍保留。</span>
+            <button class="notice-action" id="editor-reload" type="button">重新加载</button>
+          </div>
+          <div class="editor-stage">
+            <div class="empty-state" id="file-empty"><i data-lucide="file-code-2"></i><p>从左侧打开一个文件</p></div>
+            <pre class="editor-highlight hidden" id="editor-highlight" aria-hidden="true"><code></code></pre>
+            <textarea class="editor-input hidden" id="editor-input" spellcheck="false" wrap="off" aria-label="文件编辑器" disabled></textarea>
+          </div>
+        </section>
+        <div class="inspector-tabs" role="tablist">
+          <button class="tab-button active" type="button" data-tab="diff" role="tab" aria-selected="true">Diff</button>
+          <button class="tab-button" type="button" data-tab="terminal" role="tab" aria-selected="false">终端</button>
+        </div>
+        <section class="tab-panel active" id="tab-diff" role="tabpanel">
+          <div class="empty-state" id="diff-empty"><i data-lucide="git-compare-arrows"></i><p>改动会显示在这里</p></div>
+          <pre class="code-output hidden" id="diff-output"></pre>
+        </section>
+        <section class="tab-panel" id="tab-terminal" role="tabpanel">
+          <div class="terminal-output" id="terminal-output"><span class="terminal-muted">命令输出会出现在这里</span></div>
+        </section>
+      </aside>
+    </div>
+    <div class="toast hidden" id="toast" role="status"></div>
+    <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js"></script>
+    <script src="/app.js"></script>
+  </body>
+</html>

@@ -1,6 +1,6 @@
 # Evidence Coding Agent
 
-仓库地址：`https://github.com/<你的账号>/evidence-coding-agent`（创建公开仓库后替换为实际地址）。
+仓库地址：`https://github.com/XoomitLXH/evidence-coding-agent`。
 
 一个独立实现的 Python coding agent，不使用 LangChain、Agents SDK 等 agent 框架。它通过 OpenAI-compatible Chat Completions 的原生 tool calling，在受控 workspace 中读写代码、检索文件和运行命令。
 
@@ -8,10 +8,66 @@
 
 ```bash
 export OPENAI_API_KEY='仅在本机环境变量中设置'
-export OPENAI_BASE_URL='https://api.openai.com/v1'
-export MODEL='gpt-4o-mini'
+export DEEPSEEK_BASE_URL='https://api.deepseek.com'
+export MODEL='deepseek-chat'
 python3 -m coding_agent.cli --repo /path/to/repo "修复 XXX，并运行测试"
 ```
+
+## 本地 Extension / Plugin
+
+插件遵循 Claude Code / Codex 风格的本地目录约定。项目插件放在
+`.codex/plugins/<plugin-name>/`，用户插件放在 `~/.codex/plugins/<plugin-name>/`。
+也可以通过一个或多个 `--plugin-dir PATH` 显式指定目录；显式目录优先于项目、用户和内置插件。
+
+最小插件结构：
+
+```text
+my-plugin/
+├── .codex-plugin/plugin.json
+└── skills/
+    └── review/SKILL.md
+```
+
+`plugin.json` 至少包含安全标识符 `name`，可选 `version`、`skills` 和 `tools`：
+
+```json
+{
+  "name": "my-plugin",
+  "version": "1.0.0",
+  "skills": "skills",
+  "tools": "tools.py"
+}
+```
+
+`skills/*/SKILL.md` 会被索引并按任务自动匹配。任务中可以写 `@review` 或 `/review`，
+也可以使用 `--skills review,another-skill` 显式加载。技能内容只作为 workflow guidance 注入
+system prompt，任务、安全策略和工具权限始终优先。
+
+查看当前环境自动发现的插件和技能：
+
+```bash
+python3 -m coding_agent.cli --repo /path/to/repo --list-plugins
+python3 -m coding_agent.cli --repo /path/to/repo --plugin-dir /path/to/my-plugin --skills review "检查代码并运行测试"
+```
+
+本机 Codex plugin cache 中的 Superpowers、`frank-gstack-superpowers`、PDF、documents、
+presentations 和 spreadsheets 插件会自动发现（目录存在时）。插件工具通过受控 Python adapter
+导出 `register(registry)`，schema 必须是 OpenAI function tool 格式，工具名冲突会被拒绝。
+
+内置 `pdf` 插件提供 `read_pdf` 工具：只读 workspace 内的 `.pdf`，单次最多 20 页、文件最多 20 MB、
+文本最多约 160k 字符。PDF 文本提取优先使用 `pypdf`，其次使用 `pdfplumber`，两者均未安装时会返回
+明确的可选依赖错误。安装任一依赖即可启用真实提取，例如 `python3 -m pip install pypdf`。
+
+启动网页端（对话是主界面，右侧可查看 Diff、文件和终端记录）：
+
+```bash
+export OPENAI_API_KEY='仅在本机环境变量中设置'
+export DEEPSEEK_BASE_URL='https://api.deepseek.com'
+export MODEL='deepseek-chat'
+python3 -m coding_agent.web --repo /path/to/repo --port 50516
+```
+
+浏览器打开 `http://localhost:50516/`，输入任务后按“开始任务”；输入 `@` 可引用工作区文件。网页端不读取或保存 `.env`、API key 或访问令牌。
 
 无需 API key 的完整演示与测试：
 

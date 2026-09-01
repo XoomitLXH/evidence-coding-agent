@@ -54,10 +54,27 @@ def classify_command(command: str) -> str:
     return "allow" if executable in _SAFE_PREFIXES else "approval_required"
 
 
-def explain_command(command: str) -> str:
+def command_decision(command: str) -> dict[str, str]:
+    """Return a display-safe command risk decision for tools and the UI."""
     decision = classify_command(command)
-    if decision == "deny":
-        return "command rejected by safety policy"
+    if decision == "allow":
+        return {
+            "decision": decision,
+            "reason": "允许执行：该命令在本地安全命令白名单内。",
+            "recommendation": "执行后请查看退出码和验证输出。",
+        }
     if decision == "approval_required":
-        return "command requires explicit approval; use a test/build/static-check command"
-    return "command allowed"
+        return {
+            "decision": decision,
+            "reason": "该命令不在安全白名单内。",
+            "recommendation": "需要确认后才能执行；可先改用测试、构建或静态检查命令。",
+        }
+    return {
+        "decision": decision,
+        "reason": "命令包含高风险操作或不安全的 Shell 控制符。",
+        "recommendation": "请改为受限的单一安全命令，避免删除、提权、远程执行或命令拼接。",
+    }
+
+
+def explain_command(command: str) -> str:
+    return command_decision(command)["reason"]
