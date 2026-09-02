@@ -67,6 +67,27 @@ class RunCommandTests(unittest.TestCase):
         self.assertEqual(result["evidence"]["tool"], "run_command")
         self.assertEqual(result["evidence"]["exit_code"], 2)
 
+    def test_read_only_pipeline_executes_without_shell(self) -> None:
+        tests_dir = self.root / "tests"
+        tests_dir.mkdir()
+        (tests_dir / "test_smoke.py").write_text(
+            "import unittest\n\n"
+            "class SmokeTest(unittest.TestCase):\n"
+            "    def test_passes(self):\n"
+            "        self.assertTrue(True)\n",
+            encoding="utf-8",
+        )
+        result = run_command(
+            self.root,
+            AgentState(),
+            "python3 -m unittest discover -s tests -v | tail -5",
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["exit_code"], 0)
+        self.assertIn("OK", result["output"])
+        self.assertEqual(result["risk"]["decision"], "allow")
+
     def test_timeout_returns_timeout_evidence(self) -> None:
         result = run_command(
             self.root,

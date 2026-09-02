@@ -78,6 +78,89 @@ def _command_arguments(command: str) -> list[str]:
     return arguments
 
 
+def _command_pipeline(command: str) -> list[list[str]]:
+    """Parse a small, shell-free pipeline while respecting quoted pipe characters."""
+    segments: list[str] = []
+    start = 0
+    quote: str | None = None
+    escaped = False
+    for index, character in enumerate(command):
+        if escaped:
+            escaped = False
+            continue
+        if character == "\\" and quote != "'":
+            escaped = True
+            continue
+        if quote:
+            if character == quote:
+                quote = None
+            continue
+        if character in {"'", '"'}:
+            quote = character
+        elif character == "|":
+            segment = command[start:index].strip()
+            if not segment:
+                raise ValueError("pipeline contains an empty command")
+            segments.append(segment)
+            start = index + 1
+    if quote:
+        raise ValueError("unterminated quote in command")
+    segment = command[start:].strip()
+    if not segment:
+        raise ValueError("pipeline contains an empty command")
+    segments.append(segment)
+    return [_command_arguments(segment) for segment in segments]
+
+
+def _run_pipeline(
+    commands: list[list[str]],
+    *,
+    cwd: Path,
+    environment: dict[str, str],
+    timeout_seconds: int,
+) -> tuple[int, str]:
+    """Run a parsed pipeline without invoking a shell."""
+    processes: list[subprocess.Popen[str]] = []
+    previous_stdout = None
+    try:
+        for index, arguments in enumerate(commands):
+            process = subprocess.Popen(
+                arguments,
+                cwd=cwd,
+                text=True,
+                stdin=previous_stdout,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=environment,
+            )
+            if previous_stdout is not None:
+                previous_stdout.close()
+            previous_stdout = process.stdout
+            processes.append(process)
+        started = time.monotonic()
+        stdout, stderr = processes[-1].communicate(timeout=timeout_seconds)
+        # The final process has consumed the pipe; collect diagnostics from upstream stages.
+        upstream_output: list[str] = []
+        for process in processes[:-1]:
+            _, process_stderr = process.communicate(timeout=max(0.1, timeout_seconds - (time.monotonic() - started)))
+            if process_stderr:
+                upstream_output.append(process_stderr)
+        output = "".join(upstream_output) + (stdout or "") + (stderr or "")
+        return processes[-1].returncode, output
+    except subprocess.TimeoutExpired:
+        for process in processes:
+            process.kill()
+        for process in processes:
+            process.communicate()
+        raise
+    except BaseException:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+            process.communicate()
+        raise
+
+
 def _write_drafts(workspace: Path, drafts: "DraftChanges") -> None:
     """Overlay the pending agent edits on an isolated validation workspace."""
     for entry in drafts.diff():
@@ -132,6 +215,7 @@ def run_command(
     started = time.monotonic()
     failure = None
     deleted: list[str] = []
+    changed: list[str] = []
     try:
         environment = os.environ.copy()
         # Do not let a same-second, same-size source edit reuse a stale workspace .pyc.
@@ -143,22 +227,41 @@ def run_command(
                 shutil.copytree(root, command_root, symlinks=True)
                 _write_drafts(command_root, drafts)
             before = snapshot(command_root)
-            completed = subprocess.run(
-                _command_arguments(executable_command),
-                cwd=command_root,
-                text=True,
-                capture_output=True,
-                timeout=timeout_seconds,
-                env=environment,
-            )
+            pipeline = _command_pipeline(executable_command)
+            if len(pipeline) == 1:
+                completed = subprocess.run(
+                    pipeline[0],
+                    cwd=command_root,
+                    text=True,
+                    capture_output=True,
+                    timeout=timeout_seconds,
+                    env=environment,
+                )
+                output = completed.stdout + completed.stderr
+                exit_code = completed.returncode
+            else:
+                exit_code, output = _run_pipeline(
+                    pipeline,
+                    cwd=command_root,
+                    environment=environment,
+                    timeout_seconds=timeout_seconds,
+                )
             after = snapshot(command_root)
             deleted = sorted(set(before) - set(after))
             changed = sorted(
                 {*before, *after}
                 - {key for key in before.keys() & after.keys() if before[key] == after[key]}
             )
-        output = (completed.stdout + completed.stderr)[-12000:]
-        exit_code = completed.returncode
+        output = output[-12000:]
+    except ValueError as exc:
+        output = str(exc)
+        exit_code = 2
+        failure = _failure(
+            "command_failed",
+            "命令格式无效",
+            f"无法解析命令：{exc}",
+            "仅支持常规命令和简单的只读管道（命令之间使用单个 |）。",
+        )
     except subprocess.TimeoutExpired as exc:
         output = (_text(exc.stdout) + _text(exc.stderr))[-12000:] + "\nTIMEOUT"
         exit_code = 124
@@ -177,8 +280,6 @@ def run_command(
             f"无法启动命令：{exc}",
             "检查命令名称、项目依赖和本地运行环境后重试。",
         )
-    if "changed" not in locals():
-        changed = []
     duration_ms = int((time.monotonic() - started) * 1000)
     if changed and drafts is None:
         state.mark_modified(changed)
