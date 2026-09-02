@@ -16,11 +16,20 @@ class PolicyTests(unittest.TestCase):
     def test_test_command_is_allowed(self) -> None:
         self.assertEqual(classify_command("python -m unittest discover -s tests -v"), "allow")
 
-    def test_recursive_delete_is_rejected(self) -> None:
-        self.assertEqual(classify_command("rm -rf generated"), "deny")
+    def test_python_inline_check_with_code_operators_is_allowed(self) -> None:
+        command = 'python3 -c "assert 2 > 1; print(\'check passed\')"'
 
-    def test_command_chaining_is_rejected(self) -> None:
-        self.assertEqual(classify_command("pytest -q && echo unexpected"), "deny")
+        self.assertEqual(classify_command(command), "allow")
+
+    def test_recursive_delete_requires_approval(self) -> None:
+        self.assertEqual(classify_command("rm -rf generated"), "approval_required")
+
+    def test_delete_command_requires_approval_when_wrapped(self) -> None:
+        self.assertEqual(classify_command("sudo rm -rf generated"), "approval_required")
+
+    def test_non_destructive_commands_are_allowed_without_a_whitelist(self) -> None:
+        self.assertEqual(classify_command("custom-build --watch"), "allow")
+        self.assertEqual(classify_command("pytest -q && echo verification-complete"), "allow")
 
     def test_allowed_command_has_chinese_reason(self) -> None:
         decision = command_decision("python -m unittest discover -s tests -v")
@@ -28,13 +37,21 @@ class PolicyTests(unittest.TestCase):
         self.assertIn("允许执行", decision["reason"])
         self.assertTrue(decision["recommendation"])
 
-    def test_unknown_command_requests_confirmation(self) -> None:
+    def test_unknown_command_is_allowed_without_confirmation(self) -> None:
         decision = command_decision("custom-build")
-        self.assertEqual(decision["decision"], "approval_required")
-        self.assertIn("需要确认", decision["recommendation"])
+        self.assertEqual(decision["decision"], "allow")
+        self.assertIn("允许执行", decision["reason"])
+
+    def test_only_explicit_deletion_commands_require_approval(self) -> None:
+        self.assertEqual(classify_command("git clean -fd"), "approval_required")
+        self.assertEqual(classify_command("python -c \"from pathlib import Path; Path('note.txt').unlink()\""), "approval_required")
+
+    def test_non_deleting_commands_are_allowed_even_when_they_overwrite_data(self) -> None:
+        self.assertEqual(classify_command("git reset --hard HEAD"), "allow")
+        self.assertEqual(classify_command("dd if=/dev/zero of=/tmp/scratch.bin"), "allow")
 
     def test_recursive_remove_has_chinese_guidance(self) -> None:
         decision = command_decision("rm -rf generated")
-        self.assertEqual(decision["decision"], "deny")
+        self.assertEqual(decision["decision"], "approval_required")
         self.assertTrue(decision["reason"])
         self.assertTrue(decision["recommendation"])

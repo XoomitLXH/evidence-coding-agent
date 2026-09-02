@@ -6,6 +6,7 @@ import hashlib
 import mimetypes
 import json
 import secrets
+import shutil
 import tempfile
 import threading
 import time
@@ -36,13 +37,18 @@ MAX_DIFF_CHARS = 180_000
 MAX_REFERENCE_FILES = 600
 MAX_EDITOR_FILE_BYTES = 400_000
 MAX_EDITOR_REQUEST_BYTES = MAX_EDITOR_FILE_BYTES * 2 + 10_000
+PAUSED_STATUSES = {
+    "awaiting_approval",
+    "review_required",
+    "awaiting_clarification",
+}
+
 FINAL_STATUSES = {
     "complete",
     "error",
     "incomplete",
     "interrupted",
-    "awaiting_approval",
-    "review_required",
+    *PAUSED_STATUSES,
 }
 
 
@@ -72,9 +78,16 @@ def _text_snapshot(root: Path) -> dict[str, str]:
     return files
 
 
-def _editor_file(root: Path, path: str) -> dict[str, Any]:
+def _editor_file(root: Path, path: str, *, drafts: DraftChanges | None = None) -> dict[str, Any]:
     """Read an editable UTF-8 workspace file without the agent tool's line numbers."""
     file_path = safe_path(root, path)
+    relative_path = str(file_path.relative_to(root))
+    if drafts is not None and drafts.has_path(relative_path):
+        text = drafts.read_text(relative_path)
+        size = len(text.encode("utf-8"))
+        if size > MAX_EDITOR_FILE_BYTES:
+            raise PolicyError("file exceeds 400 KB editor limit")
+        return {"path": relative_path, "content": text, "bytes": size, "draft": True}
     if not file_path.is_file():
         raise PolicyError(f"not a file: {path}")
     try:
@@ -83,13 +96,25 @@ def _editor_file(root: Path, path: str) -> dict[str, Any]:
         raise PolicyError("file is not valid UTF-8 text") from exc
     if len(text.encode("utf-8")) > MAX_EDITOR_FILE_BYTES:
         raise PolicyError("file exceeds 400 KB editor limit")
-    return {"path": str(file_path.relative_to(root)), "content": text, "bytes": len(text.encode("utf-8"))}
+    return {"path": relative_path, "content": text, "bytes": len(text.encode("utf-8"))}
 
 
-def _save_editor_file(root: Path, path: str, content: str) -> dict[str, Any]:
-    file_path = safe_path(root, path)
+def _save_editor_file(
+    root: Path,
+    path: str,
+    content: str,
+    *,
+    drafts: DraftChanges | None = None,
+) -> dict[str, Any]:
+    """Save editor content to the workspace or an active task's draft area."""
     if not isinstance(content, str):
         raise PolicyError("content must be a string")
+    if drafts is not None:
+        relative_path = str(safe_path(root, path).relative_to(root.resolve()))
+        if not drafts.has_path(relative_path):
+            raise PolicyError("file is not a draft for this task")
+        return drafts.write_file(relative_path, content)
+    file_path = safe_path(root, path)
     size = len(content.encode("utf-8"))
     if size > MAX_EDITOR_FILE_BYTES:
         raise PolicyError("file content exceeds 400 KB editor limit")
@@ -117,6 +142,40 @@ class TaskRecord:
     events: list[dict[str, Any]] = field(default_factory=list)
     loop: AgentLoop | None = None
     condition: threading.Condition = field(default_factory=threading.Condition, repr=False)
+
+
+def _execute_draft_file(
+    root: Path,
+    record: TaskRecord,
+    path: str,
+    content: str | None,
+    *,
+    mode: str,
+    timeout_seconds: object,
+):
+    """Execute a review draft in an isolated copy without persisting it."""
+    loop = record.loop
+    if loop is None:
+        raise PolicyError("task has no active draft")
+    drafts = loop.registry.drafts
+    relative_path = str(safe_path(root, path).relative_to(root.resolve()))
+    draft_paths = [str(path) for path in drafts.to_dict()]
+    if relative_path not in draft_paths:
+        raise PolicyError("file is not a draft for this task")
+
+    with tempfile.TemporaryDirectory(prefix="coding-agent-draft-") as temp_dir:
+        temp_root = Path(temp_dir).resolve()
+        shutil.copytree(root, temp_root, dirs_exist_ok=True)
+        for draft_path in draft_paths:
+            _save_editor_file(temp_root, draft_path, drafts.read_text(draft_path))
+        if content is not None:
+            _save_editor_file(temp_root, relative_path, content)
+        return execute_python(
+            temp_root,
+            relative_path,
+            mode=mode,
+            timeout_seconds=timeout_seconds,
+        )
 
 
 class TaskManager:
@@ -211,7 +270,7 @@ class TaskManager:
             finished_at = item.get("finished_at")
             if status == "interrupted":
                 finished_at = finished_at or _now()
-            elif status in {"awaiting_approval", "review_required"}:
+            elif status in PAUSED_STATUSES:
                 finished_at = None
             record = TaskRecord(
                 task_id=task_id,
@@ -231,7 +290,7 @@ class TaskManager:
                 events=self._read_events(log_path),
             )
             snapshot = item.get("session")
-            if status in {"awaiting_approval", "review_required"} and isinstance(snapshot, dict):
+            if status in PAUSED_STATUSES and isinstance(snapshot, dict):
                 try:
                     model = self.model_factory() if self.model_factory else OpenAICompatibleClient(self.config)
                     loop = AgentLoop(
@@ -254,7 +313,7 @@ class TaskManager:
                         "summary": f"任务会话恢复失败：{exc}",
                         "modified_files": [],
                     }
-            elif status in {"awaiting_approval", "review_required"}:
+            elif status in PAUSED_STATUSES:
                 # Older records may only have the standalone draft/pending columns.
                 draft = item.get("draft") if isinstance(item.get("draft"), dict) else {}
                 pending = item.get("pending") if isinstance(item.get("pending"), dict) else None
@@ -386,6 +445,15 @@ class TaskManager:
             "review_required",
         )
 
+    def resume_after_clarification(self, task_id: str, instruction: str) -> TaskRecord:
+        if not isinstance(instruction, str) or not instruction.strip():
+            raise ValueError("clarification instruction must not be empty")
+        return self._resume_paused_task(
+            task_id,
+            lambda loop: loop.resume_after_clarification(instruction),
+            "awaiting_clarification",
+        )
+
     def _run(self, record: TaskRecord) -> None:
         self._run_with_continuation(record, None)
 
@@ -430,7 +498,7 @@ class TaskManager:
                     "modified_files": [],
                 }
                 record.status = record.report["status"]
-                record.finished_at = None if record.status in {"awaiting_approval", "review_required"} else _now()
+                record.finished_at = None if record.status in PAUSED_STATUSES else _now()
                 record.condition.notify_all()
             try:
                 self._persist(record)
@@ -636,7 +704,17 @@ class CodingAgentHandler(BaseHTTPRequestHandler):
             path = query.get("path", [""])[0]
             try:
                 if query.get("raw", [""])[0] == "1":
-                    self._send_json(_editor_file(self.manager.root, path))
+                    task_id = query.get("task_id", [""])[0]
+                    if task_id:
+                        record = self.manager.get_task(task_id)
+                        if not record:
+                            self._send_error_json(HTTPStatus.NOT_FOUND, "task not found")
+                            return
+                        with record.condition:
+                            drafts = record.loop.registry.drafts if record.loop else None
+                            self._send_json(_editor_file(self.manager.root, path, drafts=drafts))
+                    else:
+                        self._send_json(_editor_file(self.manager.root, path))
                 else:
                     self._send_json(read_file(self.manager.root, path))
             except PolicyError as exc:
@@ -721,6 +799,22 @@ class CodingAgentHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(self.manager.serialize(record), HTTPStatus.ACCEPTED)
             return
+        if route.startswith("/api/tasks/") and route.endswith("/clarify"):
+            task_id = route.split("/")[3]
+            try:
+                payload = self._body(max_bytes=8_000)
+                instruction = payload.get("instruction")
+                record = self.manager.resume_after_clarification(task_id, instruction)
+            except KeyError:
+                self._send_error_json(HTTPStatus.NOT_FOUND, "task not found")
+                return
+            except ValueError as exc:
+                message = str(exc)
+                status = HTTPStatus.BAD_REQUEST if "instruction must not be empty" in message else HTTPStatus.CONFLICT
+                self._send_error_json(status, message)
+                return
+            self._send_json(self.manager.serialize(record), HTTPStatus.ACCEPTED)
+            return
         if route != "/api/tasks":
             self._send_error_json(HTTPStatus.NOT_FOUND, "route not found")
             return
@@ -742,23 +836,44 @@ class CodingAgentHandler(BaseHTTPRequestHandler):
         self._send_json(self.manager.serialize(record), HTTPStatus.ACCEPTED)
 
     def _execute_file(self, route: str) -> None:
-        """Save the editor draft, then execute the selected Python file."""
+        """Execute the selected Python file, isolating review drafts."""
         try:
             payload = self._body(max_bytes=MAX_EDITOR_REQUEST_BYTES)
             path = payload.get("path")
             if not isinstance(path, str):
                 raise ValueError("path must be a string")
+            task_id = payload.get("task_id")
+            if task_id is not None and not isinstance(task_id, str):
+                raise ValueError("task_id must be a string")
+            mode = "debug" if route == "/api/debug" else "run"
+            timeout_seconds = payload.get("timeout_seconds")
             if "content" in payload:
                 content = payload.get("content")
                 if not isinstance(content, str):
                     raise ValueError("content must be a string")
-                _save_editor_file(self.manager.root, path, content)
-            result = execute_python(
-                self.manager.root,
-                path,
-                mode="debug" if route == "/api/debug" else "run",
-                timeout_seconds=payload.get("timeout_seconds"),
-            )
+            else:
+                content = None
+            if task_id:
+                record = self.manager.get_task(task_id)
+                if record is None:
+                    raise PolicyError("task not found")
+                result = _execute_draft_file(
+                    self.manager.root,
+                    record,
+                    path,
+                    content,
+                    mode=mode,
+                    timeout_seconds=timeout_seconds,
+                )
+            else:
+                if content is not None:
+                    _save_editor_file(self.manager.root, path, content)
+                result = execute_python(
+                    self.manager.root,
+                    path,
+                    mode=mode,
+                    timeout_seconds=timeout_seconds,
+                )
         except (PolicyError, ValueError) as exc:
             self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
             return
@@ -777,9 +892,22 @@ class CodingAgentHandler(BaseHTTPRequestHandler):
             payload = self._body(max_bytes=MAX_EDITOR_REQUEST_BYTES)
             path = payload.get("path")
             content = payload.get("content")
+            task_id = payload.get("task_id")
             if not isinstance(path, str):
                 raise ValueError("path must be a string")
-            self._send_json(_save_editor_file(self.manager.root, path, content))
+            if task_id is not None and not isinstance(task_id, str):
+                raise ValueError("task_id must be a string")
+            if task_id:
+                record = self.manager.get_task(task_id)
+                if record is None:
+                    raise PolicyError("task not found")
+                with record.condition:
+                    drafts = record.loop.registry.drafts if record.loop else None
+                    if drafts is None:
+                        raise PolicyError("task has no active draft")
+                    self._send_json(_save_editor_file(self.manager.root, path, content, drafts=drafts))
+            else:
+                self._send_json(_save_editor_file(self.manager.root, path, content))
         except (PolicyError, ValueError) as exc:
             self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
 

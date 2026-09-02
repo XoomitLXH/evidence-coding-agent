@@ -20,38 +20,53 @@ def safe_path(root: Path, user_path: str) -> Path:
     return candidate
 
 
-_DENY_PATTERNS = (
-    r"(^|[;&|])\s*rm\b",
-    r"\brm\s+-[^\n]*r",
-    r"\bsudo\b",
-    r"\bshutdown\b|\breboot\b",
-    r"\bgit\s+(push|reset\s+--hard|clean\s+-f)",
-    r"\bmkfs\b|\bdd\s+if=",
-    r"\bcurl\b[^\n]*\|\s*(sh|bash)",
+_DELETION_PATTERNS = (
+    r"\bfind\b[^\n]*\s-delete\b",
+    r"\bgit\s+clean\b",
+    r"\b(?:os|shutil)\.(?:remove|unlink|rmdir|rmtree)\s*\(",
+    r"\bPath\s*\([^)]*\)\.(?:unlink|rmdir)\s*\(",
 )
 
-_SHELL_CONTROL_TOKENS = ("&&", "||", ";", "|", ">", "<", "`", "$(", "\n", "\r")
 
-_SAFE_PREFIXES = {
-    "python", "python3", "pytest", "ruff", "mypy", "pyright", "go", "node",
-    "npm", "yarn", "make", "git", "pwd", "ls", "find", "rg", "grep",
-}
+def _contains_deletion(command: str) -> bool:
+    """Detect deletion invocations without matching harmless prose or string values."""
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = []
+    # Resolve common command wrappers so wrapped deletion commands are covered.
+    index = 0
+    while index < len(tokens):
+        executable = Path(tokens[index]).name.lower()
+        if executable in {"rm", "rmdir", "unlink"}:
+            return True
+        if executable in {"command", "exec"}:
+            index += 1
+            continue
+        if executable in {"sudo", "doas"}:
+            index += 1
+            while index < len(tokens) and tokens[index].startswith("-"):
+                option = tokens[index]
+                index += 1
+                if option in {"-u", "--user", "-g", "--group", "-C", "--chdir"} and index < len(tokens):
+                    index += 1
+            continue
+        if executable == "env":
+            index += 1
+            while index < len(tokens) and ("=" in tokens[index] or tokens[index].startswith("-")):
+                index += 1
+            continue
+        break
+    return any(re.search(pattern, command, flags=re.IGNORECASE) for pattern in _DELETION_PATTERNS)
 
 
 def classify_command(command: str) -> str:
-    """Return allow, approval_required, or deny."""
+    """Allow commands by default, requiring confirmation only for deletion operations."""
     if not command.strip():
         return "deny"
-    if any(token in command for token in _SHELL_CONTROL_TOKENS):
-        return "deny"
-    if any(re.search(pattern, command, flags=re.IGNORECASE) for pattern in _DENY_PATTERNS):
-        return "deny"
-    try:
-        first = shlex.split(command)[0]
-    except ValueError:
-        return "deny"
-    executable = Path(first).name
-    return "allow" if executable in _SAFE_PREFIXES else "approval_required"
+    if _contains_deletion(command):
+        return "approval_required"
+    return "allow"
 
 
 def command_decision(command: str) -> dict[str, str]:
@@ -60,19 +75,19 @@ def command_decision(command: str) -> dict[str, str]:
     if decision == "allow":
         return {
             "decision": decision,
-            "reason": "允许执行：该命令在本地安全命令白名单内。",
+            "reason": "允许执行：默认放行非删除的本地命令。",
             "recommendation": "执行后请查看退出码和验证输出。",
         }
     if decision == "approval_required":
         return {
             "decision": decision,
-            "reason": "该命令不在安全白名单内。",
-            "recommendation": "需要确认后才能执行；可先改用测试、构建或静态检查命令。",
+            "reason": "该命令包含删除文件或目录的操作。",
+            "recommendation": "请确认删除目标后点击“允许执行”；拒绝则不会修改工作区。",
         }
     return {
         "decision": decision,
-        "reason": "命令包含高风险操作或不安全的 Shell 控制符。",
-        "recommendation": "请改为受限的单一安全命令，避免删除、提权、远程执行或命令拼接。",
+        "reason": "命令无法执行：内容为空或不符合安全策略。",
+        "recommendation": "请提供有效命令；删除操作会进入审批流程。",
     }
 
 

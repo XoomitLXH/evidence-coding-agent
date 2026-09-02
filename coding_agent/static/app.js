@@ -8,6 +8,7 @@ const state = {
   history: [],
   source: null,
   activeFile: null,
+  activeFileDraft: false,
   savedContent: "",
   dirty: false,
   saving: false,
@@ -143,13 +144,16 @@ function isRunnableFile(path) {
 
 function updateEditorState() {
   state.dirty = Boolean(state.activeFile) && editorInput.value !== state.savedContent;
-  const locked = state.saving || state.executing;
+  const savingLocked = state.saving || state.executing;
+  const executionLocked = state.saving || state.executing;
   const runnable = isRunnableFile(state.activeFile);
-  saveFile.disabled = !state.activeFile || locked;
-  runFile.disabled = !state.activeFile || !runnable || locked;
-  debugFile.disabled = !state.activeFile || !runnable || locked;
+  saveFile.disabled = !state.activeFile || savingLocked;
+  runFile.disabled = !state.activeFile || !runnable || executionLocked;
+  debugFile.disabled = !state.activeFile || !runnable || executionLocked;
   if (!state.activeFile) {
     setEditorStatus("inactive", "只读");
+  } else if (state.activeFileDraft) {
+    setEditorStatus(state.dirty ? "dirty" : "saved", state.dirty ? "草稿未保存" : "可编辑草稿");
   } else if (!runnable) {
     setEditorStatus("inactive", "仅支持 Python");
   } else if (state.executing) {
@@ -275,9 +279,11 @@ function showAgentFileConflict(changedPath) {
   editorNotice.classList.remove("hidden");
 }
 
-async function loadEditorFile(path, { focus = false } = {}) {
-  const file = await fetchJson(`/api/file?path=${encodeURIComponent(path)}&raw=1`);
+async function loadEditorFile(path, { focus = false, taskId = null } = {}) {
+  const taskQuery = taskId ? `&task_id=${encodeURIComponent(taskId)}` : "";
+  const file = await fetchJson(`/api/file?path=${encodeURIComponent(path)}&raw=1${taskQuery}`);
   state.activeFile = file.path;
+  state.activeFileDraft = Boolean(file.draft);
   state.savedContent = file.content;
   editorInput.value = file.content;
   editorInput.disabled = false;
@@ -288,6 +294,22 @@ async function loadEditorFile(path, { focus = false } = {}) {
   renderEditorHighlight();
   updateEditorState();
   if (focus) editorInput.focus();
+}
+
+function clearActiveEditor() {
+  state.activeFile = null;
+  state.activeFileDraft = false;
+  state.savedContent = "";
+  state.dirty = false;
+  state.saving = false;
+  clearEditorNotice();
+  editorInput.value = "";
+  editorInput.disabled = true;
+  editorInput.classList.add("hidden");
+  byId("file-empty").classList.remove("hidden");
+  byId("editor-path").textContent = "未打开文件";
+  renderEditorHighlight();
+  updateEditorState();
 }
 
 function renderTree(entries, parent, depth = 0) {
@@ -443,7 +465,12 @@ function taskStatusLabel(status) {
     interrupted: "已中断",
     awaiting_approval: "等待命令审批",
     review_required: "等待草稿审阅",
+    awaiting_clarification: "等待补充说明",
   }[status] || "未知状态";
+}
+
+function isPauseStatus(status) {
+  return ["awaiting_approval", "review_required", "awaiting_clarification"].includes(status);
 }
 
 function taskTime(task) {
@@ -531,6 +558,27 @@ function resetTaskSurface() {
   setTaskState("", "空闲");
 }
 
+async function openTaskDraft(taskId) {
+  if (state.dirty) return;
+  const draft = await fetchJson(`/api/tasks/${encodeURIComponent(taskId)}/draft`);
+  if (!Array.isArray(draft.files) || !draft.files.length) return;
+  await loadEditorFile(choosePreferredDraftFile(draft.files), { taskId });
+}
+
+function choosePreferredDraftFile(files) {
+  const candidates = files.filter((path) => typeof path === "string");
+  if (!candidates.length) return null;
+  const score = (path) => {
+    const normalized = path.replaceAll("\\\\", "/").toLowerCase();
+    const name = normalized.split("/").pop() || normalized;
+    let value = normalized.endsWith(".py") ? 20 : 0;
+    if (["main.py", "solution.py", "app.py"].includes(name)) value += 80;
+    if (name.startsWith("test_") || name.endsWith("_test.py") || normalized.includes("/tests/")) value -= 100;
+    return value;
+  };
+  return [...candidates].sort((left, right) => score(right) - score(left) || left.localeCompare(right))[0];
+}
+
 async function openHistoricalTask(taskId) {
   if (!taskId) return;
   if (state.source) {
@@ -541,12 +589,17 @@ async function openHistoricalTask(taskId) {
     const task = await fetchJson(`/api/tasks/${encodeURIComponent(taskId)}`);
     state.activeTask = task.id;
     resetTaskSurface();
+    try {
+      await openTaskDraft(task.id);
+    } catch (error) {
+      showToast(`加载任务草稿失败：${error.message}`);
+    }
     appendMessage("user", task.task, { forceScroll: true });
     const activityLine = ensureActivityLine();
     setActivity(activityLine, "正在加载任务");
     renderTaskHistory();
     const streamState = makeStreamState(0, task.id);
-    if (["awaiting_approval", "review_required"].includes(task.status)) {
+    if (isPauseStatus(task.status)) {
       await renderPausePrompt(task.id, task, activityLine, streamState);
       return;
     }
@@ -593,7 +646,7 @@ async function saveActiveFile() {
     await fetchJson("/api/file", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path, content }),
+      body: JSON.stringify({ path, content, task_id: state.activeFileDraft ? state.activeTask : undefined }),
     });
     state.savedContent = content;
     clearEditorNotice();
@@ -611,7 +664,10 @@ async function saveActiveFile() {
 async function reloadActiveFile() {
   if (!state.activeFile) return;
   try {
-    await loadEditorFile(state.activeFile, { focus: true });
+    await loadEditorFile(state.activeFile, {
+      focus: true,
+      taskId: state.activeFileDraft ? state.activeTask : null,
+    });
     showToast("已重新加载文件内容");
   } catch (error) { showToast(error.message); }
 }
@@ -625,14 +681,25 @@ async function resolveEditorNotice() {
   const saved = await saveActiveFile();
   if (!saved || state.dirty) return;
   try {
-    await loadEditorFile(pendingPath, { focus: true });
+    await loadEditorFile(pendingPath, { focus: true, taskId: state.activeTask });
     showToast(`${pendingPath} 已打开`);
   } catch (error) { showToast(error.message); }
 }
 
 async function handleAgentFileChange(event) {
-  if (!["write_file", "apply_patch"].includes(event.name)) return;
   const result = event.result || {};
+  const deletedFiles = Array.isArray(result.deleted_files) ? result.deleted_files : [];
+  if (event.name === "run_command") {
+    if (result.approved_mutation === true && deletedFiles.length) {
+      if (state.activeFile && deletedFiles.includes(state.activeFile)) {
+        clearActiveEditor();
+        showToast("当前文件已删除，编辑器已清空");
+      }
+      loadTree().catch((error) => showToast(error.message));
+    }
+    return;
+  }
+  if (!["write_file", "apply_patch"].includes(event.name)) return;
   const changedPath = result.path || (event.arguments || {}).path;
   if (!changedPath) return;
   loadTree().catch((error) => showToast(error.message));
@@ -640,7 +707,18 @@ async function handleAgentFileChange(event) {
     showAgentFileConflict(changedPath);
     return;
   }
-  await loadEditorFile(changedPath);
+  if (state.activeTask) {
+    try {
+      const draft = await fetchJson("/api/tasks/" + encodeURIComponent(state.activeTask) + "/draft");
+      const preferred = choosePreferredDraftFile(draft.files || [changedPath]);
+      await loadEditorFile(preferred || changedPath, { taskId: state.activeTask });
+      showToast((preferred || changedPath) + " 已同步智能体的改动");
+      return;
+    } catch (error) {
+      showToast("同步草稿失败：" + error.message);
+    }
+  }
+  await loadEditorFile(changedPath, { taskId: state.activeTask });
   showToast(`${changedPath} 已同步智能体的改动`);
 }
 
@@ -737,19 +815,81 @@ function appendFinalSummary(content) {
   return message;
 }
 
-function appendPauseCard(taskId, status, draft, activityLine, streamState) {
+async function resumeAfterClarification(taskId, input, card, activityLine, streamState) {
+  const instruction = input.value.trim();
+  if (!instruction) {
+    showToast("请先补充允许范围或安全验证方式。");
+    input.focus();
+    return;
+  }
+  const controls = card.querySelectorAll("button, textarea");
+  controls.forEach((control) => { control.disabled = true; });
+  setTaskState("running", "正在恢复");
+  setActivity(activityLine, "正在恢复任务");
+  try {
+    await fetchJson(`/api/tasks/${encodeURIComponent(taskId)}/clarify`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ instruction }),
+    });
+    card.remove();
+    await loadTaskHistory();
+    streamState.pauseRendered = false;
+    startEventStream(taskId, activityLine, streamState.cursor, streamState);
+  } catch (error) {
+    controls.forEach((control) => { control.disabled = false; });
+    setTaskState("awaiting_clarification", "等待补充说明");
+    setActivity(activityLine, "等待补充说明");
+    showToast(`操作失败：${error.message}`);
+  }
+}
+
+function appendPauseCard(taskId, status, draft, failure, activityLine, streamState) {
   const card = document.createElement("article");
   card.className = "pause-card";
   card.dataset.pauseTask = taskId;
   const isReview = status === "review_required";
-  const title = isReview ? "等待草稿审阅" : "等待命令审批";
-  const description = isReview ? "智能体已准备好草稿改动，请确认后继续。" : "智能体准备执行命令，请确认是否继续。";
-  card.innerHTML = `<div class="pause-card-title">${icon(isReview ? "file-check-2" : "shield-alert")}<strong>${title}</strong></div><p>${description}</p>`;
+  const isClarification = status === "awaiting_clarification";
+  const title = isClarification ? "等待补充说明" : (isReview ? "等待草稿审阅" : "等待命令审批");
+  const description = isClarification
+    ? "安全策略阻止了当前操作。请说明允许的范围，或要求智能体换一种安全的验证方式。"
+    : (isReview ? "智能体已准备好草稿改动，请确认后继续。" : "智能体准备执行命令，请确认是否继续。");
+  card.innerHTML = `<div class="pause-card-title">${icon(isClarification ? "shield-alert" : (isReview ? "file-check-2" : "shield-alert"))}<strong>${title}</strong></div>`;
+  const descriptionNode = document.createElement("p");
+  descriptionNode.textContent = description;
+  card.appendChild(descriptionNode);
+  if (isClarification && failure?.reason) {
+    const reason = document.createElement("p");
+    reason.textContent = `限制原因：${failure.reason}`;
+    card.appendChild(reason);
+  }
   if (isReview && draft && draft.diff) {
     const details = document.createElement("pre");
     details.className = "pause-card-diff";
     details.textContent = draft.diff;
     card.appendChild(details);
+  }
+  if (isClarification) {
+    const input = document.createElement("textarea");
+    input.className = "pause-card-input";
+    input.rows = 3;
+    input.placeholder = "补充允许范围或换一种安全的验证方式";
+    input.setAttribute("aria-label", "补充说明");
+    card.appendChild(input);
+    const actions = document.createElement("div");
+    actions.className = "pause-card-actions";
+    const resume = document.createElement("button");
+    resume.type = "button";
+    resume.className = "pause-card-primary";
+    resume.textContent = "继续任务";
+    resume.addEventListener("click", () => resumeAfterClarification(taskId, input, card, activityLine, streamState));
+    actions.appendChild(resume);
+    card.appendChild(actions);
+    conversation.appendChild(card);
+    refreshIcons();
+    scrollConversationIfFollowing(true);
+    input.focus();
+    return;
   }
   const actions = document.createElement("div");
   actions.className = "pause-card-actions";
@@ -800,10 +940,11 @@ function appendPauseCard(taskId, status, draft, activityLine, streamState) {
 async function renderPausePrompt(taskId, event, activityLine, streamState) {
   if (streamState.pauseRendered) return;
   const status = event.status || event.report?.status;
-  if (!(status === "awaiting_approval" || status === "review_required")) return;
+  if (!isPauseStatus(status)) return;
   streamState.pauseRendered = true;
-  setTaskState(status, status === "review_required" ? "等待草稿审阅" : "等待命令审批");
-  setActivity(activityLine, status === "review_required" ? "等待草稿审阅" : "等待命令审批");
+  const pauseLabel = taskStatusLabel(status);
+  setTaskState(status, pauseLabel);
+  setActivity(activityLine, pauseLabel);
   sendTask.disabled = true;
   let draft = null;
   if (status === "review_required") {
@@ -818,7 +959,7 @@ async function renderPausePrompt(taskId, event, activityLine, streamState) {
     (card) => card.dataset.pauseTask === taskId,
   );
   if (state.activeTask === taskId && !hasPauseCard) {
-    appendPauseCard(taskId, status, draft, activityLine, streamState);
+    appendPauseCard(taskId, status, draft, event.report?.failure || event.failure, activityLine, streamState);
   }
 }
 
@@ -884,7 +1025,7 @@ async function executeActiveFile(mode) {
   updateEditorState();
   setTaskState("running", mode === "debug" ? "调试中" : "运行中");
   try {
-    if (state.dirty) {
+    if (!state.activeFileDraft && state.dirty) {
       const saved = await saveActiveFile();
       if (!saved || state.dirty) {
         showToast("请先完成文件保存，再执行。");
@@ -896,7 +1037,11 @@ async function executeActiveFile(mode) {
     const result = await fetchJson(endpoint, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path: state.activeFile, content: editorInput.value }),
+      body: JSON.stringify({
+        path: state.activeFile,
+        content: editorInput.value,
+        task_id: state.activeFileDraft ? state.activeTask : undefined,
+      }),
     });
     appendTerminal(result);
     appendExecutionMessage(result, mode);
@@ -1002,6 +1147,10 @@ function completeTask(report, taskId, activityLine, streamState) {
   if (streamState) streamState.turns.forEach((turn) => finalizeTurn(turn));
   sendTask.disabled = false;
   const complete = report && report.status === "complete";
+  if (complete && state.activeTask === taskId && state.activeFileDraft) {
+    state.activeFileDraft = false;
+    updateEditorState();
+  }
   setTaskState(complete ? "complete" : "error", complete ? "已验证" : "未完成");
   setActivity(activityLine, complete ? "已完成" : "执行失败", complete ? "success" : "error");
   if (report) {
@@ -1023,7 +1172,7 @@ async function reconnectOrComplete(taskId, activityLine, streamState) {
   try {
     const task = await fetchJson(`/api/tasks/${encodeURIComponent(taskId)}`);
     if (state.activeTask !== taskId || streamState.finished) return;
-    if (["awaiting_approval", "review_required"].includes(task.status)) {
+    if (isPauseStatus(task.status)) {
       await renderPausePrompt(taskId, task, activityLine, streamState);
       return;
     }

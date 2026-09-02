@@ -82,6 +82,10 @@ class DraftChanges:
     def paths(self) -> list[str]:
         return sorted(path for path, entry in self._entries.items() if entry.content != entry.before or not entry.before_exists)
 
+    def has_path(self, path: str) -> bool:
+        """Return whether a path belongs to this task's draft, even if reverted."""
+        return self._relative(path) in self._entries
+
     def diff(self, paths: list[str] | None = None) -> list[dict[str, Any]]:
         selected = paths if paths is not None else self.paths()
         result = []

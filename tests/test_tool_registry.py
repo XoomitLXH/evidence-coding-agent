@@ -27,7 +27,12 @@ class ToolRegistryTests(unittest.TestCase):
     def test_registry_exposes_shared_drafts_and_keeps_agent_write_in_memory(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
-            registry = ToolRegistry(root, AgentState(), EventLog(root / "events.jsonl"))
+            registry = ToolRegistry(
+                root,
+                AgentState(),
+                EventLog(root / "events.jsonl"),
+                require_draft_review=True,
+            )
 
             result = registry.call("write_file", {"path": "draft.txt", "content": "draft"})
 
@@ -59,7 +64,12 @@ class ToolRegistryTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "value.txt").write_text("original\n", encoding="utf-8")
-            registry = ToolRegistry(root, AgentState(), EventLog(root / "events.jsonl"))
+            registry = ToolRegistry(
+                root,
+                AgentState(),
+                EventLog(root / "events.jsonl"),
+                require_draft_review=True,
+            )
             registry.call("write_file", {"path": "value.txt", "content": "draft\n"})
 
             result = registry.call(
@@ -73,7 +83,12 @@ class ToolRegistryTests(unittest.TestCase):
     def test_finish_requires_draft_review_after_successful_validation(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
-            registry = ToolRegistry(root, AgentState(), EventLog(root / "events.jsonl"))
+            registry = ToolRegistry(
+                root,
+                AgentState(),
+                EventLog(root / "events.jsonl"),
+                require_draft_review=True,
+            )
             registry.call("write_file", {"path": "draft.txt", "content": "draft\n"})
             verification = registry.call("run_command", {"command": "python -c 'pass'"})
 

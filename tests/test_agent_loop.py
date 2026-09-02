@@ -6,7 +6,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 
-from coding_agent.agent_loop import AgentLoop
+from coding_agent.agent_loop import AgentLoop, SYSTEM_PROMPT
 
 
 def tool_response(name: str, arguments: dict[str, Any], call_id: str) -> dict[str, Any]:
@@ -69,6 +69,15 @@ class ExplodingModel:
 
 
 class AgentLoopTests(unittest.TestCase):
+    def test_system_prompt_prefers_compact_tests_after_implementation(self) -> None:
+        self.assertIn("place the main implementation and public entry points before", SYSTEM_PROMPT)
+        self.assertIn("normally 2-4 tests", SYSTEM_PROMPT)
+        self.assertIn("avoid redundant test-per-example cases", SYSTEM_PROMPT)
+        self.assertIn("def main()", SYSTEM_PROMPT)
+        self.assertIn("if __name__ == \"__main__\"", SYSTEM_PROMPT)
+        self.assertIn("tests must be at the end", SYSTEM_PROMPT)
+        self.assertIn("Do not deliver a file containing only test_* functions", SYSTEM_PROMPT)
+
     def test_phase_complete_without_verification_gate_does_not_report_complete(self) -> None:
         with TemporaryDirectory() as temp_dir:
             loop = AgentLoop(Path(temp_dir), object(), max_steps=1)
@@ -217,7 +226,7 @@ class AgentLoopTests(unittest.TestCase):
                 ]
             )
 
-            loop = AgentLoop(root, model, max_steps=5)
+            loop = AgentLoop(root, model, max_steps=5, require_draft_review=True)
             initial = loop.run("fix addition")
 
             self.assertEqual(initial["status"], "review_required")
@@ -240,53 +249,82 @@ class AgentLoopTests(unittest.TestCase):
         self.assertTrue(report["failure"]["recovery"])
         self.assertIn("模型请求失败", report["failure"]["label"])
 
-    def test_denied_tool_call_is_attributed_to_policy(self) -> None:
+    def test_deletion_tool_call_pauses_for_approval(self) -> None:
         with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "temporary-output"
+            target.write_text("keep", encoding="utf-8")
             model = ScriptedModel([
                 tool_response("run_command", {"command": "rm -rf temporary-output"}, "call-1"),
             ])
 
-            report = AgentLoop(Path(temp_dir), model, max_steps=1).run("清理临时输出")
+            loop = AgentLoop(root, model, max_steps=1)
+            report = loop.run("清理临时输出")
 
-        self.assertEqual(report["failure"]["type"], "policy_rejected")
-        self.assertIn("安全策略", report["failure"]["label"])
+            self.assertEqual(report["status"], "awaiting_approval")
+            self.assertEqual(report["failure"]["type"], "awaiting_approval")
+            self.assertTrue(target.exists())
 
-    def test_policy_rejection_pauses_and_clarification_resumes_without_replaying_command(self) -> None:
+            report = loop.resume_after_approval(approved=True)
+            self.assertNotEqual(report["status"], "awaiting_approval")
+            self.assertFalse(target.exists())
+
+    def test_approved_deletion_continues_to_verification_and_finishes(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
+            target = root / "temporary-output"
+            target.write_text("keep", encoding="utf-8")
+            command = "python3 -c \"from pathlib import Path; assert not Path('temporary-output').exists()\""
             model = ScriptedModel([
                 tool_response("run_command", {"command": "rm -rf temporary-output"}, "call-1"),
-                tool_response("finish", {"summary": "已根据允许范围重新规划。"}, "call-2"),
+                tool_response("run_command", {"command": command}, "call-2"),
+                tool_response("finish", {"summary": "临时输出已删除并验证。"}, "call-3"),
+            ])
+            loop = AgentLoop(root, model, max_steps=4)
+
+            initial = loop.run("清理临时输出")
+            report = loop.resume_after_approval(approved=True)
+
+            self.assertEqual(initial["status"], "awaiting_approval")
+            self.assertEqual(report["status"], "complete")
+            self.assertFalse(target.exists())
+            self.assertEqual(len(model.messages_seen), 3)
+            self.assertEqual(
+                [item["command"] for item in report["verification"]],
+                ["rm -rf temporary-output", command],
+            )
+            events = (root / "run.jsonl").read_text(encoding="utf-8")
+            self.assertIn('\"type\": \"run_finished\"', events)
+
+
+    def test_approval_rejection_does_not_modify_workspace_or_replay_command(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            root = Path(temp_dir)
+            target = root / "temporary-output"
+            target.write_text("keep", encoding="utf-8")
+            model = ScriptedModel([
+                tool_response("run_command", {"command": "rm -rf temporary-output"}, "call-1"),
             ])
             loop = AgentLoop(root, model, max_steps=2)
 
             initial = loop.run("清理临时输出")
 
-            self.assertEqual(initial["status"], "awaiting_clarification")
-            self.assertEqual(initial["failure"]["type"], "policy_rejected")
+            self.assertEqual(initial["status"], "awaiting_approval")
+            self.assertEqual(initial["failure"]["type"], "awaiting_approval")
             self.assertEqual(len(model.messages_seen), 1)
-            self.assertEqual(len(model.responses), 1)
-            events = (root / "run.jsonl").read_text(encoding="utf-8")
-            self.assertIn('"type": "run_paused"', events)
-            self.assertNotIn('"type": "run_finished"', events)
-
-            report = loop.resume_after_clarification("仅允许检查 temporary-output 目录，不要删除文件。")
-
-            self.assertEqual(report["status"], "complete")
-            self.assertEqual(len(model.messages_seen), 2)
-            continuation = model.messages_seen[1]
-            self.assertEqual(continuation[-3]["role"], "assistant")
-            self.assertEqual(continuation[-2]["role"], "tool")
-            self.assertIn("policy_rejected", continuation[-2]["content"])
-            self.assertEqual(continuation[-1]["role"], "user")
-            self.assertIn("仅允许检查 temporary-output 目录", continuation[-1]["content"])
-            self.assertIn("不会自动重放", continuation[-1]["content"])
+            self.assertEqual(len(model.responses), 0)
+            report = loop.resume_after_approval(approved=False)
+            self.assertEqual(report["failure"]["type"], "approval_rejected")
+            self.assertTrue(target.exists())
+            self.assertEqual(len(model.messages_seen), 1)
+            self.assertIn('\"type\": \"run_finished\"', (root / "run.jsonl").read_text(encoding="utf-8"))
 
     def test_clarification_requires_a_non_empty_instruction_and_matching_pause(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             model = ScriptedModel([
-                tool_response("run_command", {"command": "rm -rf temporary-output"}, "call-1"),
+                tool_response("run_command", {"command": ""}, "call-1"),
             ])
             loop = AgentLoop(root, model, max_steps=1)
 
@@ -308,69 +346,58 @@ class AgentLoopTests(unittest.TestCase):
         self.assertEqual(report["failure"]["type"], "command_failed")
         self.assertIn("退出码 2", report["failure"]["reason"])
 
-    def test_unknown_command_pauses_without_consuming_another_model_response(self) -> None:
+    def test_non_deleting_command_continues_without_approval(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             model = ScriptedModel([
-                tool_response("run_command", {"command": "echo approved-only"}, "call-1"),
+                tool_response("run_command", {"command": "/bin/echo allowed-without-approval"}, "call-1"),
                 tool_response("finish", {"summary": "命令已执行。"}, "call-2"),
             ])
 
             report = AgentLoop(root, model, max_steps=2).run("运行额外检查")
 
-            self.assertEqual(report["status"], "awaiting_approval")
-            self.assertEqual(report["failure"]["type"], "awaiting_approval")
-            self.assertEqual(len(model.messages_seen), 1)
-            self.assertEqual(len(model.responses), 1)
-            self.assertEqual(report["verification"], [])
+            self.assertEqual(report["status"], "complete")
+            self.assertIsNone(report["failure"])
+            self.assertEqual(len(model.messages_seen), 2)
+            self.assertEqual(model.responses, [])
+            self.assertEqual(len(report["verification"]), 1)
             events = (root / "run.jsonl").read_text(encoding="utf-8")
-            self.assertIn('"type": "run_paused"', events)
-            self.assertNotIn('"type": "run_finished"', events)
+            self.assertNotIn('"type": "run_paused"', events)
+            self.assertIn('"type": "run_finished"', events)
 
-    def test_approval_resumes_the_same_model_context_after_executing_pending_command(self) -> None:
+    def test_non_deleting_command_result_reaches_the_follow_up_context(self) -> None:
         with TemporaryDirectory() as temp_dir:
             model = ScriptedModel([
-                tool_response("run_command", {"command": "echo approved-only"}, "call-1"),
+                tool_response("run_command", {"command": "/bin/echo allowed-without-approval"}, "call-1"),
                 tool_response("finish", {"summary": "命令已执行。"}, "call-2"),
             ])
             loop = AgentLoop(Path(temp_dir), model, max_steps=2)
 
-            initial = loop.run("运行额外检查")
-            report = loop.resume_after_approval(approved=True)
+            report = loop.run("运行额外检查")
 
-            self.assertEqual(initial["status"], "awaiting_approval")
             self.assertEqual(report["status"], "complete")
             self.assertEqual(len(model.messages_seen), 2)
             continuation = model.messages_seen[1]
             self.assertEqual(continuation[-3]["role"], "assistant")
             self.assertEqual(continuation[-2]["role"], "tool")
-            self.assertIn("approved-only", continuation[-2]["content"])
+            self.assertIn("allowed-without-approval", continuation[-2]["content"])
             self.assertEqual(continuation[-1]["role"], "user")
 
-    def test_approval_pause_survives_a_loop_snapshot_and_restores_context(self) -> None:
+    def test_non_deleting_command_does_not_leave_a_pending_approval_in_snapshot(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            initial_model = ScriptedModel([
-                tool_response("run_command", {"command": "echo approved-only"}, "call-1"),
-            ])
-            first_loop = AgentLoop(root, initial_model, max_steps=2)
-
-            initial = first_loop.run("运行额外检查")
-            snapshot = first_loop.session_snapshot()
-            resumed_model = ScriptedModel([
+            model = ScriptedModel([
+                tool_response("run_command", {"command": "/bin/echo allowed-without-approval"}, "call-1"),
                 tool_response("finish", {"summary": "命令已执行。"}, "call-2"),
             ])
-            restored_loop = AgentLoop(root, resumed_model, max_steps=2)
-            restored_loop.restore_session(snapshot)
-            report = restored_loop.resume_after_approval(approved=True)
+            loop = AgentLoop(root, model, max_steps=2)
 
-            self.assertEqual(initial["status"], "awaiting_approval")
+            report = loop.run("运行额外检查")
+            snapshot = loop.session_snapshot()
+
             self.assertEqual(report["status"], "complete")
-            continuation = resumed_model.messages_seen[0]
-            self.assertEqual(continuation[-3]["role"], "assistant")
-            self.assertEqual(continuation[-2]["role"], "tool")
-            self.assertIn("approved-only", continuation[-2]["content"])
-            self.assertEqual(continuation[-1]["role"], "user")
+            self.assertIsNone(snapshot["paused_status"])
+            self.assertIsNone(snapshot["pending_call"])
 
     def test_finish_with_drafts_pauses_for_review_without_writing_workspace(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -384,7 +411,7 @@ class AgentLoopTests(unittest.TestCase):
                 tool_response("finish", {"summary": "不应被请求。"}, "call-4"),
             ])
 
-            report = AgentLoop(root, model, max_steps=4).run("更新说明")
+            report = AgentLoop(root, model, max_steps=4, require_draft_review=True).run("更新说明")
 
             self.assertEqual(report["status"], "review_required")
             self.assertEqual(report["failure"]["type"], "review_required")
@@ -402,11 +429,11 @@ class AgentLoopTests(unittest.TestCase):
                 tool_response("run_command", {"command": "python -c \"assert __import__('pathlib').Path('note.txt').read_text() == 'after\\n'\""}, "call-2"),
                 tool_response("finish", {"summary": "草稿已准备。"}, "call-3"),
             ])
-            first_loop = AgentLoop(root, initial_model, max_steps=4)
+            first_loop = AgentLoop(root, initial_model, max_steps=4, require_draft_review=True)
 
             initial = first_loop.run("更新说明")
             snapshot = first_loop.session_snapshot()
-            restored_loop = AgentLoop(root, ScriptedModel([]), max_steps=4)
+            restored_loop = AgentLoop(root, ScriptedModel([]), max_steps=4, require_draft_review=True)
             restored_loop.restore_session(snapshot)
             accepted = restored_loop.registry.drafts.accept()
             report = restored_loop.resume_after_review(accepted=True)

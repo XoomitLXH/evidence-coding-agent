@@ -63,13 +63,13 @@ class BlockingModel:
         return tool_response("finish", {"summary": "关闭竞态测试完成"}, "blocking-finish")
 
 
-class ApprovalThenFinishModel:
-    """A restart-safe model: a tool result means the approval decision was recorded."""
+class SafeCommandThenFinishModel:
+    """A restart-safe model that finishes after a non-deleting command runs."""
 
     def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> dict[str, Any]:
         if not any(message.get("role") == "tool" for message in messages):
-            return tool_response("run_command", {"command": "custom-check"}, "approval-command")
-        return tool_response("finish", {"summary": "审批处理完成。"}, "approval-finish")
+            return tool_response("run_command", {"command": "/bin/echo allowed-without-approval"}, "safe-command")
+        return tool_response("finish", {"summary": "非删除命令已执行。"}, "safe-finish")
 
 
 class DraftReviewModel:
@@ -92,17 +92,52 @@ class DraftReviewModel:
         return tool_response("finish", {"summary": "草稿审阅完成。"}, "draft-finish")
 
 
+class DraftCreatedFileModel:
+    """A restart-safe model that creates a new file kept behind draft review."""
+
+    content = "def oranges_rotting(grid: list[list[int]]) -> int:\n    return 0\n"
+
+    def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> dict[str, Any]:
+        tool_names = [str(message.get("name") or "") for message in messages if message.get("role") == "tool"]
+        if "write_file" not in tool_names:
+            return tool_response(
+                "write_file",
+                {"path": "rotting_oranges.py", "content": self.content},
+                "draft-write",
+            )
+        if "run_command" not in tool_names:
+            return tool_response(
+                "run_command",
+                {"command": "python3 -m compileall -q ."},
+                "draft-created-verify",
+            )
+        return tool_response("finish", {"summary": "新建草稿等待审阅。"}, "draft-created-finish")
+
+
 class PolicyClarificationModel:
-    """A restart-safe model that proposes a blocked command once, then replans."""
+    """A restart-safe model that submits an invalid command once, then replans."""
 
     def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> dict[str, Any]:
         if not any(message.get("role") == "tool" for message in messages):
             return tool_response(
                 "run_command",
-                {"command": "rm -rf temporary-output"},
-                "blocked-command",
+                {"command": ""},
+                "invalid-command",
             )
         return tool_response("finish", {"summary": "已按允许范围重新规划完成。"}, "clarified-finish")
+
+
+class DeletionApprovalModel:
+    """Requests one destructive command, then finishes after approval."""
+
+    def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> dict[str, Any]:
+        if not any(message.get("role") == "tool" for message in messages):
+            return tool_response(
+                "run_command",
+                {"command": "rm -f approved-delete.txt"},
+                "delete-command",
+            )
+        return tool_response("finish", {"summary": "已按允许执行删除并完成任务。"}, "delete-finish")
 
 
 class WebApiTests(unittest.TestCase):
@@ -269,6 +304,28 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(saved["bytes"], len(content.encode("utf-8")))
         self.assertEqual((self.workspace / "note.txt").read_text(encoding="utf-8"), content)
 
+    def test_editor_can_open_a_new_draft_file_for_its_task(self) -> None:
+        with TemporaryDirectory() as storage_dir:
+            storage = Path(storage_dir)
+            self.replace_server(DraftCreatedFileModel, storage)
+            created = self.request_json(
+                "/api/tasks",
+                method="POST",
+                payload={"task": "生成 rotting_oranges.py 并等待我审阅", "mode": "execute"},
+            )
+            self.wait_for_task_status(created["id"], "review_required")
+
+            self.replace_server(DraftCreatedFileModel, storage)
+            self.wait_for_task_status(created["id"], "review_required")
+
+            opened = self.request_json(
+                f"/api/file?path=rotting_oranges.py&raw=1&task_id={created['id']}"
+            )
+
+            self.assertEqual(opened["content"], DraftCreatedFileModel.content)
+            self.assertTrue(opened["draft"])
+            self.assertFalse((self.workspace / "rotting_oranges.py").exists())
+
     def test_background_task_publishes_events_and_a_bounded_diff(self) -> None:
         created = self.request_json(
             "/api/tasks",
@@ -377,6 +434,37 @@ class WebApiTests(unittest.TestCase):
             script,
         )
 
+    def test_application_shell_can_resume_a_policy_clarification_pause(self) -> None:
+        with urllib.request.urlopen(f"{self.base_url}/app.js", timeout=3) as response:
+            script = response.read().decode("utf-8")
+
+        self.assertIn('awaiting_clarification: "等待补充说明"', script)
+        self.assertIn("function resumeAfterClarification", script)
+        self.assertIn("/clarify", script)
+        self.assertIn("补充允许范围或换一种安全的验证方式", script)
+
+    def test_workspace_sidebar_keeps_the_path_and_refresh_control_separate(self) -> None:
+        with urllib.request.urlopen(f"{self.base_url}/", timeout=3) as response:
+            document = response.read().decode("utf-8")
+        with urllib.request.urlopen(f"{self.base_url}/styles.css", timeout=3) as response:
+            stylesheet = response.read().decode("utf-8")
+
+        self.assertIn('class="sidebar-section workspace-section"', document)
+        self.assertIn('id="refresh-tree"', document)
+        self.assertIn('class="workspace-path" id="workspace-path"', document)
+        self.assertIn(
+            ".workspace-section { display: grid; min-height: 0; flex: 1; grid-template-rows: 28px auto minmax(0, 1fr); }",
+            stylesheet,
+        )
+        self.assertIn(
+            ".section-heading { justify-content: space-between; gap: 8px; min-width: 0;",
+            stylesheet,
+        )
+        self.assertIn(
+            ".workspace-path { min-width: 0; overflow: hidden;",
+            stylesheet,
+        )
+
     def test_application_shell_includes_editable_ide_controls(self) -> None:
         with urllib.request.urlopen(f"{self.base_url}/", timeout=3) as response:
             document = response.read().decode("utf-8")
@@ -410,6 +498,23 @@ class WebApiTests(unittest.TestCase):
         self.assertIn("function isRunnableFile(path)", script)
         self.assertIn("!isRunnableFile(state.activeFile)", script)
         self.assertIn("仅支持 Python", script)
+        self.assertIn("task_id: state.activeFileDraft ? state.activeTask : undefined", script)
+        self.assertIn("const executionLocked = state.saving || state.executing;", script)
+        self.assertNotIn("runFile.disabled = !state.activeFile || !runnable || locked;", script)
+        self.assertIn("editorInput.disabled = false", script)
+
+    def test_completed_task_clears_consumed_draft_editor_state(self) -> None:
+        with urllib.request.urlopen(f"{self.base_url}/app.js", timeout=3) as response:
+            script = response.read().decode("utf-8")
+
+        self.assertIn(
+            'if (complete && state.activeTask === taskId && state.activeFileDraft) {',
+            script,
+        )
+        self.assertIn(
+            'state.activeFileDraft = false;',
+            script,
+        )
 
     def test_run_endpoint_saves_content_and_returns_process_details(self) -> None:
         payload = self.request_json(
@@ -431,6 +536,31 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(payload["stderr"], "")
         self.assertGreaterEqual(payload["duration_ms"], 0)
         self.assertEqual((self.workspace / "src" / "main.py").read_text(encoding="utf-8"), "print('edited')\n")
+
+    def test_run_endpoint_executes_review_draft_without_persisting(self) -> None:
+        with TemporaryDirectory() as storage_dir:
+            storage = Path(storage_dir)
+            self.replace_server(DraftCreatedFileModel, storage)
+            created = self.request_json(
+                "/api/tasks",
+                method="POST",
+                payload={"task": "生成 rotting_oranges.py 并等待我审阅", "mode": "execute"},
+            )
+            self.wait_for_task_status(created["id"], "review_required")
+
+            result = self.request_json(
+                "/api/run",
+                method="POST",
+                payload={
+                    "path": "rotting_oranges.py",
+                    "content": DraftCreatedFileModel.content,
+                    "task_id": created["id"],
+                },
+            )
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["path"], "rotting_oranges.py")
+            self.assertFalse((self.workspace / "rotting_oranges.py").exists())
 
     def test_debug_endpoint_returns_traceback_for_runtime_error(self) -> None:
         payload = self.request_json(
@@ -478,15 +608,45 @@ class WebApiTests(unittest.TestCase):
             script = response.read().decode("utf-8")
 
         self.assertIn("async function handleAgentFileChange(event)", script)
+        self.assertIn("function clearActiveEditor()", script)
+        self.assertIn("const deletedFiles = Array.isArray(result.deleted_files) ? result.deleted_files : [];", script)
+        self.assertIn('if (event.name === "run_command") {', script)
+        self.assertIn("clearActiveEditor();", script)
         self.assertIn('if (!["write_file", "apply_patch"].includes(event.name)) return;', script)
         self.assertIn("if (!changedPath) return;", script)
         self.assertIn("if (state.dirty) {", script)
-        self.assertIn("await loadEditorFile(changedPath);", script)
+        self.assertIn("choosePreferredDraftFile", script)
+        self.assertIn("await loadEditorFile(preferred || changedPath, { taskId: state.activeTask });", script)
+        self.assertIn("activeFileDraft: false", script)
+        self.assertIn("可编辑草稿", script)
         self.assertIn("loadTree().catch", script)
         self.assertNotIn(
             'if (!state.activeFile || !["write_file", "apply_patch"].includes(event.name)) return;',
             script,
         )
+
+    def test_editor_can_save_active_task_draft_without_persisting_to_workspace(self) -> None:
+        with TemporaryDirectory() as storage_dir:
+            storage = Path(storage_dir)
+            self.replace_server(DraftCreatedFileModel, storage)
+            created = self.request_json(
+                "/api/tasks",
+                method="POST",
+                payload={"task": "生成 rotting_oranges.py 并等待我审阅", "mode": "execute"},
+            )
+            self.wait_for_task_status(created["id"], "review_required")
+            edited = "print('edited draft')\n"
+            saved = self.request_json(
+                "/api/file",
+                method="PUT",
+                payload={"path": "rotting_oranges.py", "content": edited, "task_id": created["id"]},
+            )
+            self.assertTrue(saved["draft"])
+            loaded = self.request_json(
+                f"/api/file?path=rotting_oranges.py&raw=1&task_id={created['id']}",
+            )
+            self.assertEqual(loaded["content"], edited)
+            self.assertFalse((self.workspace / "rotting_oranges.py").exists())
 
     def test_task_manager_restores_completed_task_report_and_events_after_restart(self) -> None:
         from coding_agent.web import TaskManager
@@ -558,42 +718,62 @@ class WebApiTests(unittest.TestCase):
             self.assertIn("服务重启", restored.report["summary"])
             manager.close(timeout=2)
 
-    def test_approval_pause_survives_restart_and_rejecting_it_resumes_task(self) -> None:
+    def test_non_deleting_command_completes_without_an_approval_pause(self) -> None:
         with TemporaryDirectory() as storage_dir:
             storage = Path(storage_dir)
-            self.replace_server(ApprovalThenFinishModel, storage)
+            self.replace_server(SafeCommandThenFinishModel, storage)
             created = self.request_json(
                 "/api/tasks",
                 method="POST",
-                payload={"task": "执行自定义检查，需要我先审批。", "mode": "execute"},
+                payload={"task": "执行额外检查。", "mode": "execute"},
             )
-            paused = self.wait_for_task_status(created["id"], "awaiting_approval")
+            finished = self.wait_for_finished_task(created["id"])
 
-            self.assertIsNone(paused["finished_at"])
-            self.assertEqual(paused["report"]["status"], "awaiting_approval")
+            self.assertEqual(finished["status"], "complete")
             record = self.server.manager.get_task(created["id"])
             assert record is not None
-            _, event_stream_finished = self.server.manager.wait_for_events(record, len(record.events), timeout=0)
-            self.assertTrue(event_stream_finished)
-            stored = self.server.manager.session_store.get_task(created["id"])
-            assert stored is not None
-            self.assertIsInstance(stored["pending"], dict)
-            self.assertIsInstance(stored["session"], dict)
+            events = "\n".join(json.dumps(event, ensure_ascii=False) for event in record.events)
+            self.assertNotIn('"status": "awaiting_approval"', events)
+            self.assertIn("非删除命令已执行", finished["report"]["summary"])
 
-            self.replace_server(ApprovalThenFinishModel, storage)
-            restored = self.request_json(f"/api/tasks/{created['id']}")
-            self.assertEqual(restored["status"], "awaiting_approval")
-            self.assertIsNone(restored["finished_at"])
+    def test_approved_deletion_executes_once_and_task_finishes(self) -> None:
+        with TemporaryDirectory() as storage_dir:
+            storage = Path(storage_dir)
+            target = self.workspace / "approved-delete.txt"
+            target.write_text("remove me", encoding="utf-8")
+            self.replace_server(DeletionApprovalModel, storage)
+            created = self.request_json(
+                "/api/tasks",
+                method="POST",
+                payload={"task": "删除已批准的临时文件", "mode": "execute"},
+            )
+            paused = self.wait_for_task_status(created["id"], "awaiting_approval")
+            self.assertTrue(target.exists())
+            self.assertIsNone(paused["finished_at"])
+            self.assertEqual(paused["pending"]["name"], "run_command")
 
             resumed = self.request_json(
                 f"/api/tasks/{created['id']}/approval",
                 method="POST",
-                payload={"approved": False},
+                payload={"approved": True},
             )
             self.assertEqual(resumed["status"], "running")
             finished = self.wait_for_finished_task(created["id"])
+
             self.assertEqual(finished["status"], "complete")
-            self.assertIn("审批处理完成", finished["report"]["summary"])
+            self.assertFalse(target.exists())
+            self.assertIsNotNone(finished["finished_at"])
+            self.assertNotEqual(finished["status"], "awaiting_approval")
+            record = self.server.manager.get_task(created["id"])
+            assert record is not None
+            delete_calls = [
+                event
+                for event in record.events
+                if event.get("type") == "tool_call"
+                and event.get("name") == "run_command"
+                and event.get("arguments", {}).get("command") == "rm -f approved-delete.txt"
+            ]
+            self.assertEqual(len(delete_calls), 1)
 
     def test_review_pause_exposes_draft_after_restart_and_accepting_it_commits(self) -> None:
         with TemporaryDirectory() as storage_dir:
@@ -626,25 +806,9 @@ class WebApiTests(unittest.TestCase):
             self.assertEqual(finished["status"], "complete")
             self.assertEqual((self.workspace / "note.txt").read_text(encoding="utf-8"), "final\n")
 
-    def test_approval_and_review_reject_non_boolean_decisions(self) -> None:
+    def test_review_rejects_a_non_boolean_decision(self) -> None:
         with TemporaryDirectory() as storage_dir:
             storage = Path(storage_dir)
-            self.replace_server(ApprovalThenFinishModel, storage)
-            approval = self.request_json(
-                "/api/tasks",
-                method="POST",
-                payload={"task": "审批参数校验", "mode": "execute"},
-            )
-            self.wait_for_task_status(approval["id"], "awaiting_approval")
-            with self.assertRaises(urllib.error.HTTPError) as raised:
-                self.request_json(
-                    f"/api/tasks/{approval['id']}/approval",
-                    method="POST",
-                    payload={"approved": 1},
-                )
-            self.assertEqual(raised.exception.code, 400)
-            raised.exception.close()
-
             self.replace_server(DraftReviewModel, storage)
             review = self.request_json(
                 "/api/tasks",
@@ -678,7 +842,7 @@ class WebApiTests(unittest.TestCase):
 
             record = self.server.manager.get_task(created["id"])
             assert record is not None
-            self.assertEqual(len(record.events), 4)
+            self.assertEqual(len(record.events), 5)
             self.assertTrue(any(event["type"] == "run_paused" for event in record.events))
 
             resumed = self.request_json(
@@ -691,8 +855,34 @@ class WebApiTests(unittest.TestCase):
             self.assertEqual(finished["status"], "complete")
             self.assertIn("允许范围", finished["report"]["summary"])
 
-            events = "\n".join(json.dumps(event, ensure_ascii=False) for event in record.events)
-            self.assertEqual(events.count("rm -rf temporary-output"), 1)
+            rejected_command_calls = [
+                event
+                for event in record.events
+                if event["type"] == "tool_call"
+                and event.get("name") == "run_command"
+                and event.get("arguments", {}).get("command") == ""
+            ]
+            self.assertEqual(len(rejected_command_calls), 1)
+
+    def test_policy_clarification_pause_ends_the_event_stream(self) -> None:
+        with TemporaryDirectory() as storage_dir:
+            self.replace_server(PolicyClarificationModel, Path(storage_dir))
+            created = self.request_json(
+                "/api/tasks",
+                method="POST",
+                payload={"task": "检查临时输出", "mode": "execute"},
+            )
+            paused = self.wait_for_task_status(created["id"], "awaiting_clarification")
+            record = self.server.manager.get_task(created["id"])
+            assert record is not None
+
+            _, event_stream_finished = self.server.manager.wait_for_events(
+                record,
+                paused["event_count"],
+                timeout=0,
+            )
+
+            self.assertTrue(event_stream_finished)
 
     def test_clarify_endpoint_validates_instruction_task_and_status(self) -> None:
         with TemporaryDirectory() as storage_dir:
@@ -872,6 +1062,8 @@ class WebApiTests(unittest.TestCase):
         self.assertIn("/resume", script)
         self.assertIn("event_count", script)
         self.assertIn("/draft", script)
+        self.assertIn("async function openTaskDraft", script)
+        self.assertIn("await openTaskDraft(task.id)", script)
         self.assertIn("/approval", script)
         self.assertIn("/review", script)
         self.assertIn("等待命令审批", script)

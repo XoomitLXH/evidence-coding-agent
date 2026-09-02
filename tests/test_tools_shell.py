@@ -23,25 +23,40 @@ class RunCommandTests(unittest.TestCase):
 
         self.assertEqual(arguments[0], sys.executable)
 
-    def test_denied_command_returns_structured_policy_failure(self) -> None:
+    def test_deletion_command_waits_for_approval_without_modifying_workspace(self) -> None:
+        target = self.root / "to-delete.txt"
+        target.write_text("keep me\n", encoding="utf-8")
         state = AgentState()
-        result = run_command(self.root, state, "rm -rf never-run")
-
-        self.assertFalse(result["ok"])
-        self.assertEqual(result["risk"]["decision"], "deny")
-        self.assertEqual(result["failure"]["type"], "policy_rejected")
-        self.assertEqual(result["changed_files"], [])
-        self.assertEqual(state.verification, [])
-
-    def test_unknown_command_waits_for_approval_without_execution(self) -> None:
-        state = AgentState()
-        result = run_command(self.root, state, "custom-build")
+        result = run_command(self.root, state, "rm -f to-delete.txt")
 
         self.assertFalse(result["ok"])
         self.assertEqual(result["risk"]["decision"], "approval_required")
         self.assertEqual(result["failure"]["type"], "awaiting_approval")
         self.assertEqual(result["changed_files"], [])
+        self.assertEqual(result["deleted_files"], [])
         self.assertEqual(state.verification, [])
+        self.assertTrue(target.exists())
+
+    def test_approved_deletion_executes_in_real_workspace(self) -> None:
+        target = self.root / "to-delete.txt"
+        target.write_text("remove me\n", encoding="utf-8")
+        state = AgentState()
+        result = run_command(self.root, state, "rm -f to-delete.txt", approval_granted=True)
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(target.exists())
+        self.assertEqual(result["deleted_files"], ["to-delete.txt"])
+        self.assertTrue(state.can_finish())
+
+    def test_non_whitelisted_non_deleting_command_executes_without_approval(self) -> None:
+        state = AgentState()
+        result = run_command(self.root, state, "/bin/echo allowed-without-approval")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["risk"]["decision"], "allow")
+        self.assertIsNone(result["failure"])
+        self.assertEqual(result["changed_files"], [])
+        self.assertEqual(len(state.verification), 1)
 
     def test_nonzero_command_returns_failure_evidence(self) -> None:
         result = run_command(self.root, AgentState(), "python -c 'raise SystemExit(2)'")

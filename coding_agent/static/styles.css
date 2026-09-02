@@ -81,8 +81,10 @@ button { color: inherit; }
 
 .sidebar { grid-row: 2; display: flex; min-height: 0; flex-direction: column; border-right: 1px solid var(--line); background: #181d21; }
 .sidebar-section { padding: 14px 10px 0; }
-.workspace-section { display: flex; min-height: 0; flex: 1; flex-direction: column; }
-.section-heading { justify-content: space-between; min-height: 28px; padding: 0 2px; color: var(--muted); font-size: 12px; font-weight: 600; }
+.workspace-section { display: grid; min-height: 0; flex: 1; grid-template-rows: 28px auto minmax(0, 1fr); }
+.section-heading { justify-content: space-between; gap: 8px; min-width: 0; min-height: 28px; padding: 0 2px; color: var(--muted); font-size: 12px; font-weight: 600; }
+.section-heading > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.section-heading .icon-button { flex: 0 0 auto; }
 .session-list { display: grid; gap: 3px; max-height: 250px; overflow-y: auto; }
 .session-empty { padding: 9px 8px; color: #718089; font-size: 11px; }
 .session-item { display: flex; width: 100%; min-width: 0; align-items: center; gap: 5px; min-height: 49px; padding: 5px 6px 5px 8px; border: 1px solid transparent; border-radius: 4px; background: transparent; color: var(--muted); cursor: pointer; text-align: left; }
@@ -100,8 +102,8 @@ button { color: inherit; }
 .resume-task { padding: 3px 6px; border: 1px solid #52636b; border-radius: 3px; background: transparent; color: #b8e8e0; cursor: pointer; font-size: 10px; }
 .resume-task:hover { border-color: var(--accent); background: rgba(120, 213, 202, .1); }
 .resume-task:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-.workspace-path { overflow: hidden; margin: 2px 2px 7px; color: #b0bac2; font: 11px var(--mono); text-overflow: ellipsis; white-space: nowrap; }
-.file-tree { overflow: auto; padding-bottom: 8px; }
+.workspace-path { min-width: 0; overflow: hidden; margin: 3px 2px 9px; color: #9ca8b1; font: 11px var(--mono); line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
+.file-tree { min-height: 0; overflow: auto; padding-bottom: 8px; }
 .file-row { display: flex; width: 100%; min-height: 28px; align-items: center; gap: 7px; padding: 0 7px; border: 0; border-radius: 4px; background: transparent; color: #b7c0c7; cursor: pointer; text-align: left; }
 .file-row:hover { background: var(--panel-raised); color: var(--text); }
 .file-row svg { width: 15px; height: 15px; flex: 0 0 auto; color: var(--muted); }

@@ -21,7 +21,22 @@ run an appropriate test, build, or static-check command. If a command fails, ins
 repair the code, and rerun it. A read-only task with no failed commands may call finish without
 running a command. After modifying the workspace, you may call finish only when a clean
 verification command for the latest revision exits 0.
+Once a clean verification command has passed for the latest revision, do not run redundant
+extra verification; call finish. Never use shell pipes, redirection, or command chaining; issue
+one policy-compliant command per tool call.
 Never claim success without tool evidence. Keep changes focused and explain unresolved issues.
+When generating code, place the main implementation and public entry points before helpers,
+examples, or tests. Do not create test functions or test files unless the task requests them or
+a focused regression test is necessary. When tests are needed, follow the project's separate
+test-file convention where available; cover only distinct important behavior (normally 2-4 tests)
+and avoid redundant test-per-example cases.
+For Python files, write imports, constants/types, and the core implementation first. Put def main()
+after the core implementation, followed immediately by if __name__ == "__main__": main() when the
+program has a command-line entry point. Create tests only when the user explicitly requests them or
+an existing project convention requires them; tests must be at the end of the file. Do not deliver a file containing only
+test_* functions as the implementation requested by the user. If a separate
+test_<module>.py file is needed, write the full main module before creating the test file.
+Do not deliver a file containing only test_* functions.
 默认使用中文回复，最终总结也使用中文；代码、命令和文件路径保持原样。
 """
 
@@ -294,10 +309,16 @@ class AgentLoop:
                 result=result,
                 state=self.state.prompt_context(),
             )
+        self.tool_failures.pop("awaiting_approval", None)
         self._record_tool_failure(result)
         self._append_tool_result(call, name, result, int(pending.get("step") or self.next_step))
         self.pending_call = None
         self.paused_status = None
+        if not approved:
+            # A rejected destructive command is terminal for this run. Do not
+            # ask the model to continue, since it could replay or vary the
+            # command and make the rejection look like an execution failure.
+            return self._finish("error")
         self.messages.append({"role": "user", "content": f"Continue the task. Current state: {self.state.prompt_context()}"})
         return self._continue()
 
@@ -531,7 +552,7 @@ class AgentLoop:
                 self.model_error,
                 "检查模型配置、网络连接和服务额度后重试。",
             )
-        for failure_type in ("invalid_tool_protocol", "policy_rejected", "timeout", "command_failed"):
+        for failure_type in ("invalid_tool_protocol", "policy_rejected", "approval_rejected", "timeout", "command_failed"):
             failure = self.tool_failures.get(failure_type)
             if failure:
                 return _failure(

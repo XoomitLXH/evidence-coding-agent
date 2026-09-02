@@ -74,7 +74,10 @@ class AgentState:
         return bool(
             self.verification
             and self.verification[-1].get("exit_code") == 0
-            and self.verification[-1].get("is_clean_verification")
+            and (
+                self.verification[-1].get("is_clean_verification")
+                or self.verification[-1].get("is_approved_mutation")
+            )
         )
 
     def mark_modified(self, paths: list[str]) -> None:
@@ -92,8 +95,10 @@ class AgentState:
         duration_ms: int,
         *,
         workspace_changed: bool = False,
+        approved_mutation: bool = False,
     ) -> None:
-        is_clean_verification = exit_code == 0 and not workspace_changed
+        is_approved_mutation = exit_code == 0 and approved_mutation
+        is_clean_verification = exit_code == 0 and not workspace_changed and not approved_mutation
         self.verification.append({
             "command": command,
             "exit_code": exit_code,
@@ -102,12 +107,16 @@ class AgentState:
             "timestamp": now_iso(),
             "revision": self.revision,
             "is_clean_verification": is_clean_verification,
+            "is_approved_mutation": is_approved_mutation,
         })
-        if is_clean_verification:
+        if is_clean_verification or is_approved_mutation:
             self.verified_revision = self.revision
             self.dirty = False
             self.phase = "VERIFY"
-            self.add_ledger(f"Verification passed: {command}")
+            if is_approved_mutation:
+                self.add_ledger(f"Approved mutation completed: {command}")
+            else:
+                self.add_ledger(f"Verification passed: {command}")
         elif exit_code == 0:
             self.phase = "VERIFY"
             self.add_ledger(f"Command changed workspace: {command}. Run a clean verification command.")

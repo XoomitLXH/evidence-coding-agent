@@ -6,7 +6,7 @@ from typing import Any, Callable
 
 from .event_log import EventLog
 from .draft import DraftChanges
-from .policy import PolicyError
+from .policy import PolicyError, classify_command
 from .state import AgentState
 from .tools_files import apply_patch, list_dir, read_file, write_file
 from .tools_search import search_code
@@ -122,10 +122,14 @@ class ToolRegistry:
     def execute_approved_command(self, arguments: dict[str, Any]) -> dict[str, Any]:
         """Execute one command that the user approved after the agent was paused."""
         try:
+            # Deletion approval must affect the user's real workspace. Draft
+            # isolation is still used for ordinary verification commands.
+            command = str(arguments.get("command") or "")
+            approved_drafts = None if classify_command(command) == "approval_required" else self.drafts
             result = run_command(
                 self.root,
                 self.state,
-                drafts=self.drafts,
+                drafts=approved_drafts,
                 approval_granted=True,
                 **arguments,
             )

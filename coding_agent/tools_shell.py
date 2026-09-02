@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 
 from .policy import PolicyError, command_decision
 from .state import AgentState
-from .workspace import changed_files, snapshot
+from .workspace import snapshot
 
 if TYPE_CHECKING:
     from .draft import DraftChanges
@@ -121,6 +121,8 @@ def run_command(
             "duration_ms": 0,
             "output": "",
             "changed_files": [],
+            "deleted_files": [],
+            "approved_mutation": False,
             "risk": risk,
             "failure": failure,
             "evidence": _evidence(command, None, 0, failure["reason"]),
@@ -129,6 +131,7 @@ def run_command(
         raise PolicyError("timeout_seconds must be between 1 and 300")
     started = time.monotonic()
     failure = None
+    deleted: list[str] = []
     try:
         environment = os.environ.copy()
         # Do not let a same-second, same-size source edit reuse a stale workspace .pyc.
@@ -148,7 +151,12 @@ def run_command(
                 timeout=timeout_seconds,
                 env=environment,
             )
-            changed = changed_files(command_root, before)
+            after = snapshot(command_root)
+            deleted = sorted(set(before) - set(after))
+            changed = sorted(
+                {*before, *after}
+                - {key for key in before.keys() & after.keys() if before[key] == after[key]}
+            )
         output = (completed.stdout + completed.stderr)[-12000:]
         exit_code = completed.returncode
     except subprocess.TimeoutExpired as exc:
@@ -174,7 +182,20 @@ def run_command(
     duration_ms = int((time.monotonic() - started) * 1000)
     if changed and drafts is None:
         state.mark_modified(changed)
-    state.record_command(command, exit_code, output, duration_ms, workspace_changed=bool(changed))
+    approved_mutation = bool(
+        approval_granted
+        and risk["decision"] == "approval_required"
+        and exit_code == 0
+        and drafts is None
+    )
+    state.record_command(
+        command,
+        exit_code,
+        output,
+        duration_ms,
+        workspace_changed=bool(changed),
+        approved_mutation=approved_mutation,
+    )
     if exit_code != 0 and failure is None:
         failure = _failure(
             "command_failed",
@@ -189,6 +210,8 @@ def run_command(
         "duration_ms": duration_ms,
         "output": output,
         "changed_files": changed,
+        "deleted_files": deleted,
+        "approved_mutation": approved_mutation,
         "risk": risk,
         "failure": failure,
         "evidence": _evidence(command, exit_code, duration_ms, output),
